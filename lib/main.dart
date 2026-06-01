@@ -1,8 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   runApp(const MyApp());
@@ -118,6 +122,20 @@ class ChatMessage {
   final ChatRole role;
   final String bodyMarkdown;
   final DateTime createdAt;
+
+  factory ChatMessage.fromJson(Map<String, dynamic> json) {
+    return ChatMessage(
+      id: json['id'] as int? ?? 0,
+      phase: _phaseFromApi(json['phase'] as String? ?? 'introduction'),
+      role: (json['role'] as String? ?? 'assistant') == 'user'
+          ? ChatRole.user
+          : ChatRole.assistant,
+      bodyMarkdown: json['body_markdown'] as String? ?? '',
+      createdAt:
+          DateTime.tryParse(json['created_at'] as String? ?? '') ??
+          DateTime.now(),
+    );
+  }
 }
 
 class Lesson {
@@ -146,6 +164,23 @@ class Lesson {
   int curiositySatisfaction;
 
   bool get needsAttention => refresherAvailable || curiosityAvailable;
+
+  factory Lesson.fromJson(Map<String, dynamic> json) {
+    return Lesson(
+      id: json['id'] as int? ?? 0,
+      topic: json['topic'] as String? ?? '',
+      interlocutor: json['interlocutor'] as String? ?? '',
+      title: json['title'] as String? ?? '',
+      createdAt:
+          DateTime.tryParse(json['created_at'] as String? ?? '') ??
+          DateTime.now(),
+      refresherAvailable: json['refresher_available'] as bool? ?? false,
+      curiosityAvailable: json['curiosity_available'] as bool? ?? false,
+      refresherStarted: json['refresher_started_at'] != null,
+      curiosityStarted: json['curiosity_started_at'] != null,
+      curiositySatisfaction: json['curiosity_satisfaction'] as int? ?? 0,
+    );
+  }
 }
 
 class ComprehensionQuestion {
@@ -162,6 +197,16 @@ class ComprehensionQuestion {
   String? answer;
   String? feedback;
   bool? isCorrect;
+
+  factory ComprehensionQuestion.fromJson(Map<String, dynamic> json) {
+    return ComprehensionQuestion(
+      id: json['id'] as int? ?? 0,
+      question: json['question'] as String? ?? '',
+      answer: json['answer'] as String?,
+      feedback: json['feedback'] as String?,
+      isCorrect: json['is_correct'] as bool?,
+    );
+  }
 }
 
 class DiaryEntry {
@@ -174,6 +219,16 @@ class DiaryEntry {
   final int id;
   final DateTime date;
   final String bodyMarkdown;
+
+  factory DiaryEntry.fromJson(Map<String, dynamic> json) {
+    return DiaryEntry(
+      id: json['id'] as int? ?? 0,
+      date:
+          DateTime.tryParse(json['entry_date'] as String? ?? '') ??
+          DateTime.now(),
+      bodyMarkdown: json['body_markdown'] as String? ?? '',
+    );
+  }
 }
 
 abstract class CuriosityApi {
@@ -183,10 +238,271 @@ abstract class CuriosityApi {
   Future<List<ChatMessage>> listMessages(int lessonId, Phase phase);
   Future<List<ChatMessage>> sendMessage(int lessonId, Phase phase, String body);
   Future<List<ChatMessage>> startQuestions(int lessonId);
+  Future<List<ComprehensionQuestion>> listQuestions(int lessonId);
   Future<List<ChatMessage>> answerQuestion(int lessonId, String answer);
   Future<List<ChatMessage>> startPhase(int lessonId, Phase phase);
   Future<List<DiaryEntry>> listDiary();
   Future<List<AppLogEntry>> listBackendLogs();
+}
+
+class RestCuriosityApi implements CuriosityApi {
+  RestCuriosityApi({
+    required this.logger,
+    this.backendBaseUrl = const String.fromEnvironment(
+      'API_BASE_URL',
+      defaultValue: 'http://127.0.0.1:8000/api',
+    ),
+    http.Client? client,
+  }) : client = client ?? http.Client();
+
+  final FrontendLogger logger;
+  final String backendBaseUrl;
+  final http.Client client;
+  final Map<int, int> _currentQuestionByLesson = {};
+  int? _userId;
+
+  @override
+  Future<String> createUser(String name) async {
+    final json = await _post('/users', {'name': name.trim()});
+    _userId = json['id'] as int?;
+    final createdName = json['name'] as String? ?? name.trim();
+    logger.info('Created backend user $_userId');
+    return createdName;
+  }
+
+  @override
+  Future<List<Lesson>> listLessons() async {
+    final userId = _userId;
+    if (userId == null) {
+      return [];
+    }
+    final json = await _getList('/lessons?user_id=$userId');
+    return json.whereType<Map<String, dynamic>>().map(Lesson.fromJson).toList();
+  }
+
+  @override
+  Future<Lesson> createLesson(String topic, String interlocutor) async {
+    final userId = _requireUser();
+    final json = await _post('/lessons', {
+      'user_id': userId,
+      'topic': topic.trim(),
+      'interlocutor': interlocutor.trim(),
+    });
+    logger.info('Created backend lesson ${json['id']}');
+    return Lesson.fromJson(json);
+  }
+
+  @override
+  Future<List<ChatMessage>> listMessages(int lessonId, Phase phase) async {
+    final json = await _getList(
+      '/lessons/$lessonId/messages?phase=${_phaseToApi(phase)}',
+    );
+    return json
+        .whereType<Map<String, dynamic>>()
+        .map(ChatMessage.fromJson)
+        .toList();
+  }
+
+  @override
+  Future<List<ChatMessage>> sendMessage(
+    int lessonId,
+    Phase phase,
+    String body,
+  ) async {
+    final json = await _post('/lessons/$lessonId/messages', {
+      'phase': _phaseToApi(phase),
+      'body_markdown': body.trim(),
+    });
+    final messages = <ChatMessage>[
+      ChatMessage.fromJson(json['user_message'] as Map<String, dynamic>),
+      for (final item in json['assistant_messages'] as List<dynamic>)
+        ChatMessage.fromJson(item as Map<String, dynamic>),
+    ];
+    logger.debug('Sent backend ${phase.label} message for lesson $lessonId');
+    return messages;
+  }
+
+  @override
+  Future<List<ChatMessage>> startQuestions(int lessonId) async {
+    final json = await _post('/lessons/$lessonId/understood', {});
+    _rememberCurrentQuestion(
+      lessonId,
+      json['questions'] as List<dynamic>? ?? [],
+    );
+    final assistant = json['assistant_message'];
+    logger.info('Started backend comprehension questions for lesson $lessonId');
+    return assistant is Map<String, dynamic>
+        ? [ChatMessage.fromJson(assistant)]
+        : [];
+  }
+
+  @override
+  Future<List<ComprehensionQuestion>> listQuestions(int lessonId) async {
+    final json = await _getList('/lessons/$lessonId/questions');
+    final questions = json
+        .whereType<Map<String, dynamic>>()
+        .map(ComprehensionQuestion.fromJson)
+        .toList();
+    _rememberCurrentQuestion(lessonId, json);
+    return questions;
+  }
+
+  @override
+  Future<List<ChatMessage>> answerQuestion(int lessonId, String answer) async {
+    final questionId = await _currentQuestionId(lessonId);
+    final json = await _post('/lessons/$lessonId/answers', {
+      'question_id': questionId,
+      'answer': answer.trim(),
+    });
+    _rememberCurrentQuestion(
+      lessonId,
+      json['questions'] as List<dynamic>? ?? [],
+    );
+    final messages = <ChatMessage>[
+      ChatMessage.fromJson(json['user_message'] as Map<String, dynamic>),
+      ChatMessage.fromJson(json['feedback_message'] as Map<String, dynamic>),
+    ];
+    final next = json['next_question_message'];
+    if (next is Map<String, dynamic>) {
+      messages.add(ChatMessage.fromJson(next));
+    }
+    logger.debug(
+      'Answered backend comprehension question for lesson $lessonId',
+    );
+    return messages;
+  }
+
+  @override
+  Future<List<ChatMessage>> startPhase(int lessonId, Phase phase) async {
+    final json = await _post(
+      '/lessons/$lessonId/phases/${_phaseToApi(phase)}/start',
+      {},
+    );
+    final assistant = json['assistant_message'];
+    logger.info('Started backend ${phase.label} phase for lesson $lessonId');
+    return assistant is Map<String, dynamic>
+        ? [ChatMessage.fromJson(assistant)]
+        : [];
+  }
+
+  @override
+  Future<List<DiaryEntry>> listDiary() async {
+    final userId = _userId;
+    if (userId == null) {
+      return [];
+    }
+    final json = await _getList('/diary?user_id=$userId');
+    return json
+        .whereType<Map<String, dynamic>>()
+        .map(DiaryEntry.fromJson)
+        .toList();
+  }
+
+  @override
+  Future<List<AppLogEntry>> listBackendLogs() async {
+    try {
+      final json = await _getList('/logs?limit=200', logErrors: false);
+      logger.info('Pulled ${json.length} backend log entries');
+      return json
+          .whereType<Map<String, dynamic>>()
+          .map(AppLogEntry.fromBackendJson)
+          .toList();
+    } catch (exception) {
+      logger.warning('Backend logs unavailable: $exception');
+      return [];
+    }
+  }
+
+  Future<int> _currentQuestionId(int lessonId) async {
+    final known = _currentQuestionByLesson[lessonId];
+    if (known != null) {
+      return known;
+    }
+    final questions = await _getList('/lessons/$lessonId/questions');
+    _rememberCurrentQuestion(lessonId, questions);
+    final resolved = _currentQuestionByLesson[lessonId];
+    if (resolved == null) {
+      throw StateError('No unanswered comprehension question is available.');
+    }
+    return resolved;
+  }
+
+  void _rememberCurrentQuestion(int lessonId, List<dynamic> rawQuestions) {
+    final questions = rawQuestions
+        .whereType<Map<String, dynamic>>()
+        .map(ComprehensionQuestion.fromJson)
+        .toList();
+    final unanswered = questions.where((question) => question.answer == null);
+    if (unanswered.isEmpty) {
+      _currentQuestionByLesson.remove(lessonId);
+    } else {
+      _currentQuestionByLesson[lessonId] = unanswered.first.id;
+    }
+  }
+
+  int _requireUser() {
+    final userId = _userId;
+    if (userId == null) {
+      throw StateError('Create a user before starting lessons.');
+    }
+    return userId;
+  }
+
+  Future<Map<String, dynamic>> _post(
+    String path,
+    Map<String, dynamic> body,
+  ) async {
+    final response = await client
+        .post(
+          Uri.parse('$backendBaseUrl$path'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 60));
+    return _decodeObject(response);
+  }
+
+  Future<List<dynamic>> _getList(String path, {bool logErrors = true}) async {
+    try {
+      final response = await client
+          .get(Uri.parse('$backendBaseUrl$path'))
+          .timeout(const Duration(seconds: 10));
+      final decoded = _decode(response);
+      if (decoded is List<dynamic>) {
+        return decoded;
+      }
+      throw StateError('Expected a JSON list from $path.');
+    } catch (exception) {
+      if (logErrors) {
+        logger.warning('Backend request failed: $exception');
+      }
+      rethrow;
+    }
+  }
+
+  Map<String, dynamic> _decodeObject(http.Response response) {
+    final decoded = _decode(response);
+    if (decoded is Map<String, dynamic>) {
+      return decoded;
+    }
+    throw StateError('Expected a JSON object.');
+  }
+
+  dynamic _decode(http.Response response) {
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      String detail = response.body;
+      try {
+        final decoded = jsonDecode(response.body);
+        if (decoded is Map<String, dynamic>) {
+          detail = decoded['detail']?.toString() ?? detail;
+        }
+      } catch (_) {
+        // Keep the raw body.
+      }
+      throw StateError('Backend HTTP ${response.statusCode}: $detail');
+    }
+    return jsonDecode(response.body);
+  }
 }
 
 class MockCuriosityApi implements CuriosityApi {
@@ -302,6 +618,11 @@ class MockCuriosityApi implements CuriosityApi {
     final message = _assistant(Phase.introduction, first.question);
     _messages[lessonId]!.add(message);
     return [message];
+  }
+
+  @override
+  Future<List<ComprehensionQuestion>> listQuestions(int lessonId) async {
+    return List.unmodifiable(_questions[lessonId] ?? []);
   }
 
   @override
@@ -471,11 +792,29 @@ String _titleCase(String value) {
       .join(' ');
 }
 
+String _phaseToApi(Phase phase) {
+  return switch (phase) {
+    Phase.introduction => 'introduction',
+    Phase.refresher => 'refresher',
+    Phase.curiosity => 'curiosity',
+  };
+}
+
+Phase _phaseFromApi(String value) {
+  return switch (value) {
+    'refresher' => Phase.refresher,
+    'curiosity' => Phase.curiosity,
+    _ => Phase.introduction,
+  };
+}
+
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
+    const useMockApi = bool.fromEnvironment('USE_MOCK_API');
+    final logger = FrontendLogger.instance;
     return MaterialApp(
       title: 'Curiosity',
       debugShowCheckedModeBanner: false,
@@ -501,8 +840,10 @@ class MyApp extends StatelessWidget {
         ),
       ),
       home: CuriosityShell(
-        api: MockCuriosityApi(logger: FrontendLogger.instance),
-        logger: FrontendLogger.instance,
+        api: useMockApi
+            ? MockCuriosityApi(logger: logger)
+            : RestCuriosityApi(logger: logger),
+        logger: logger,
       ),
     );
   }
@@ -524,13 +865,16 @@ class _CuriosityShellState extends State<CuriosityShell> {
   Lesson? selectedLesson;
   List<Lesson> lessons = [];
   List<DiaryEntry> diary = [];
+  Uint8List? userAvatarBytes;
   String? error;
   bool askedForName = false;
+  bool enterSendsReply = true;
 
   @override
   void initState() {
     super.initState();
     _load();
+    _loadLocalSettings();
   }
 
   Future<void> _load() async {
@@ -604,10 +948,17 @@ class _CuriosityShellState extends State<CuriosityShell> {
         api: widget.api,
         lesson: selectedLesson,
         onLessonChanged: _refreshLesson,
+        userAvatarBytes: userAvatarBytes,
+        enterSendsReply: enterSendsReply,
       ),
       'diary' => DiaryPage(entries: diary),
       'settings' => SettingsPage(
         userName: userName ?? 'Guest',
+        userAvatarBytes: userAvatarBytes,
+        enterSendsReply: enterSendsReply,
+        showEnterKeySetting: _supportsEnterKeySetting,
+        onPickAvatar: _pickUserAvatar,
+        onEnterSendsReplyChanged: _setEnterSendsReply,
         onLogs: () => _go('logs'),
       ),
       'logs' => LogsPage(api: widget.api, logger: widget.logger),
@@ -625,6 +976,9 @@ class _CuriosityShellState extends State<CuriosityShell> {
 
   void _go(String page) {
     setState(() => activePage = page);
+    if (page == 'home' || page == 'history' || page == 'diary') {
+      _load();
+    }
   }
 
   Future<void> _createLesson(String topic, String interlocutor) async {
@@ -658,6 +1012,59 @@ class _CuriosityShellState extends State<CuriosityShell> {
     }
     if (mounted) {
       setState(() {});
+    }
+  }
+
+  bool get _supportsEnterKeySetting {
+    return kIsWeb || defaultTargetPlatform == TargetPlatform.windows;
+  }
+
+  Future<void> _loadLocalSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final avatar = prefs.getString('user_avatar_base64');
+      if (mounted) {
+        setState(() {
+          enterSendsReply = prefs.getBool('enter_sends_reply') ?? true;
+          userAvatarBytes = avatar == null ? null : base64Decode(avatar);
+        });
+      }
+    } catch (exception) {
+      widget.logger.warning('Local settings unavailable: $exception');
+    }
+  }
+
+  Future<void> _setEnterSendsReply(bool value) async {
+    setState(() => enterSendsReply = value);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('enter_sends_reply', value);
+    } catch (exception) {
+      widget.logger.warning('Could not save Enter key setting: $exception');
+    }
+  }
+
+  Future<void> _pickUserAvatar() async {
+    try {
+      final picked = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 256,
+        maxHeight: 256,
+        imageQuality: 85,
+      );
+      if (picked == null) {
+        return;
+      }
+      final bytes = await picked.readAsBytes();
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('user_avatar_base64', base64Encode(bytes));
+      if (mounted) {
+        setState(() => userAvatarBytes = bytes);
+      }
+      widget.logger.info('Updated user profile picture');
+    } catch (exception) {
+      widget.logger.error('Profile picture upload failed: $exception');
+      setState(() => error = 'Could not update profile picture.');
     }
   }
 
@@ -917,12 +1324,16 @@ class LessonPage extends StatefulWidget {
     required this.api,
     required this.lesson,
     required this.onLessonChanged,
+    required this.userAvatarBytes,
+    required this.enterSendsReply,
     super.key,
   });
 
   final CuriosityApi api;
   final Lesson? lesson;
   final Future<void> Function() onLessonChanged;
+  final Uint8List? userAvatarBytes;
+  final bool enterSendsReply;
 
   @override
   State<LessonPage> createState() => _LessonPageState();
@@ -930,32 +1341,76 @@ class LessonPage extends StatefulWidget {
 
 class _LessonPageState extends State<LessonPage> {
   Phase phase = Phase.introduction;
-  List<ChatMessage> messages = [];
+  final Map<Phase, List<ChatMessage>> phaseMessages = {
+    for (final item in Phase.values) item: <ChatMessage>[],
+  };
+  bool questionsStarted = false;
   final input = TextEditingController();
+  final scrollController = ScrollController();
   bool busy = false;
+  bool processingVisible = false;
+  Timer? processingTimer;
+  Timer? refreshTimer;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _loadAll();
+    refreshTimer = Timer.periodic(
+      const Duration(seconds: 15),
+      (_) => _refreshLessonState(),
+    );
   }
 
   @override
   void didUpdateWidget(covariant LessonPage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.lesson?.id != widget.lesson?.id) {
-      _load();
+      _loadAll();
+    } else if (oldWidget.lesson != widget.lesson) {
+      setState(() {});
     }
   }
 
-  Future<void> _load() async {
+  @override
+  void dispose() {
+    refreshTimer?.cancel();
+    processingTimer?.cancel();
+    scrollController.dispose();
+    input.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadAll() async {
     if (widget.lesson == null) {
       return;
     }
-    messages = await widget.api.listMessages(widget.lesson!.id, phase);
-    if (mounted) {
-      setState(() {});
+    final lessonId = widget.lesson!.id;
+    final loaded = <Phase, List<ChatMessage>>{};
+    for (final item in Phase.values) {
+      loaded[item] = await widget.api.listMessages(lessonId, item);
     }
+    final questions = await widget.api.listQuestions(lessonId);
+    if (mounted) {
+      setState(() {
+        phaseMessages
+          ..clear()
+          ..addAll(loaded);
+        questionsStarted = questions.isNotEmpty;
+        final visible = _visiblePhases;
+        if (!visible.contains(phase)) {
+          phase = visible.last;
+        }
+      });
+      _scrollToBottom(jump: true);
+    }
+  }
+
+  Future<void> _refreshLessonState() async {
+    if (widget.lesson == null || busy) {
+      return;
+    }
+    await widget.onLessonChanged();
   }
 
   @override
@@ -967,6 +1422,8 @@ class _LessonPageState extends State<LessonPage> {
         child: Text('No lesson selected.'),
       );
     }
+    final visiblePhases = _visiblePhases;
+    final currentMessages = phaseMessages[phase] ?? [];
     return Column(
       key: ValueKey('lesson-${lesson.id}'),
       children: [
@@ -997,81 +1454,109 @@ class _LessonPageState extends State<LessonPage> {
             ],
           ),
         ),
-        SegmentedButton<Phase>(
-          segments: Phase.values
-              .map(
-                (item) => ButtonSegment(
-                  value: item,
-                  icon: _phaseIcon(item, lesson),
-                  label: Text(item.label),
-                ),
-              )
-              .toList(),
-          selected: {phase},
-          onSelectionChanged: (selection) {
-            setState(() => phase = selection.first);
-            _load();
-          },
-        ),
+        if (visiblePhases.length > 1)
+          SegmentedButton<Phase>(
+            segments: visiblePhases
+                .map(
+                  (item) => ButtonSegment(
+                    value: item,
+                    icon: _phaseIcon(item),
+                    label: Text(item.label),
+                  ),
+                )
+                .toList(),
+            selected: {phase},
+            onSelectionChanged: (selection) {
+              setState(() => phase = selection.first);
+              _scrollToBottom(jump: true);
+            },
+          ),
         Expanded(
           child: ListView.builder(
+            controller: scrollController,
             padding: const EdgeInsets.all(16),
-            itemCount: messages.length,
-            itemBuilder: (context, index) =>
-                ChatBubble(message: messages[index]),
+            itemCount: currentMessages.length,
+            itemBuilder: (context, index) => ChatBubble(
+              message: currentMessages[index],
+              userAvatarBytes: widget.userAvatarBytes,
+            ),
           ),
         ),
         _phaseAction(lesson),
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 180),
+          child: processingVisible
+              ? Padding(
+                  key: const ValueKey('processing'),
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+                  child: Align(
+                    alignment: Alignment.center,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.surfaceContainerHighest,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Padding(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
+                        child: Text('Processing your reply...'),
+                      ),
+                    ),
+                  ),
+                )
+              : const SizedBox.shrink(key: ValueKey('no-processing')),
+        ),
         ChatComposer(
           controller: input,
           busy: busy,
+          enterSendsReply: widget.enterSendsReply,
           onSend: () => _send(lesson),
         ),
       ],
     );
   }
 
-  Widget _phaseIcon(Phase item, Lesson lesson) {
-    final waiting =
-        item == Phase.refresher && lesson.refresherAvailable ||
-        item == Phase.curiosity && lesson.curiosityAvailable;
-    return Icon(waiting ? Icons.error_rounded : Icons.chat_rounded);
+  List<Phase> get _visiblePhases {
+    final visible = Phase.values
+        .where((item) => (phaseMessages[item] ?? []).isNotEmpty)
+        .toList();
+    return visible.isEmpty ? [Phase.introduction] : visible;
   }
 
+  Widget _phaseIcon(Phase item) => const Icon(Icons.chat_rounded);
+
   Widget _phaseAction(Lesson lesson) {
-    if (phase == Phase.introduction) {
-      return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16),
-        child: OutlinedButton.icon(
-          icon: const Icon(Icons.check_circle_rounded),
-          label: const Text('Understood!'),
-          onPressed: busy
-              ? null
-              : () => _run(() => widget.api.startQuestions(lesson.id)),
-        ),
-      );
-    }
-    if (phase == Phase.refresher && !lesson.refresherStarted) {
-      return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16),
-        child: FilledButton.icon(
-          icon: const Icon(Icons.bolt_rounded),
-          label: const Text('Open refresher'),
-          onPressed: lesson.refresherAvailable
-              ? () => _run(() => widget.api.startPhase(lesson.id, phase))
-              : null,
-        ),
-      );
-    }
-    if (phase == Phase.curiosity && !lesson.curiosityStarted) {
+    if (lesson.curiosityAvailable && !lesson.curiosityStarted) {
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16),
         child: FilledButton.icon(
           icon: const Icon(Icons.psychology_alt_rounded),
           label: const Text('Meet Curiosity'),
-          onPressed: lesson.curiosityAvailable
-              ? () => _run(() => widget.api.startPhase(lesson.id, phase))
-              : null,
+          onPressed: busy ? null : () => _startPhase(lesson, Phase.curiosity),
+        ),
+      );
+    }
+    if (lesson.refresherAvailable && !lesson.refresherStarted) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: FilledButton.icon(
+          icon: const Icon(Icons.bolt_rounded),
+          label: const Text('Open refresher'),
+          onPressed: busy ? null : () => _startPhase(lesson, Phase.refresher),
+        ),
+      );
+    }
+    if (phase == Phase.introduction && !questionsStarted) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: OutlinedButton.icon(
+          icon: const Icon(Icons.check_circle_rounded),
+          label: const Text('Understood!'),
+          onPressed: busy ? null : () => _startQuestions(lesson),
         ),
       );
     }
@@ -1079,34 +1564,105 @@ class _LessonPageState extends State<LessonPage> {
   }
 
   Future<void> _send(Lesson lesson) async {
+    if (busy) {
+      return;
+    }
     final text = input.text.trim();
     if (text.isEmpty) {
       return;
     }
     input.clear();
     if (phase == Phase.introduction && _looksLikeQuestionAnswer()) {
-      await _run(() => widget.api.answerQuestion(lesson.id, text));
+      await _run(phase, () => widget.api.answerQuestion(lesson.id, text));
     } else {
-      await _run(() => widget.api.sendMessage(lesson.id, phase, text));
+      await _run(phase, () => widget.api.sendMessage(lesson.id, phase, text));
     }
   }
 
   bool _looksLikeQuestionAnswer() {
-    return messages.isNotEmpty &&
+    final messages = phaseMessages[Phase.introduction] ?? [];
+    return questionsStarted &&
+        phase == Phase.introduction &&
+        messages.isNotEmpty &&
         messages.last.role == ChatRole.assistant &&
-        messages.last.bodyMarkdown.endsWith('?');
+        messages.last.bodyMarkdown.trim().endsWith('?');
   }
 
-  Future<void> _run(Future<List<ChatMessage>> Function() action) async {
-    setState(() => busy = true);
-    final newMessages = await action();
-    await widget.onLessonChanged();
+  Future<void> _startQuestions(Lesson lesson) async {
+    await _run(Phase.introduction, () => widget.api.startQuestions(lesson.id));
     if (mounted) {
-      setState(() {
-        messages.addAll(newMessages);
-        busy = false;
-      });
+      setState(() => questionsStarted = true);
     }
+  }
+
+  Future<void> _startPhase(Lesson lesson, Phase targetPhase) async {
+    await _run(
+      targetPhase,
+      () => widget.api.startPhase(lesson.id, targetPhase),
+    );
+    if (mounted) {
+      setState(() => phase = targetPhase);
+      _scrollToBottom(jump: true);
+    }
+  }
+
+  Future<void> _run(
+    Phase targetPhase,
+    Future<List<ChatMessage>> Function() action,
+  ) async {
+    _showProcessing();
+    setState(() => busy = true);
+    try {
+      final newMessages = await action();
+      await widget.onLessonChanged();
+      if (mounted) {
+        setState(() {
+          final current = phaseMessages[targetPhase] ?? <ChatMessage>[];
+          phaseMessages[targetPhase] = [...current, ...newMessages];
+          busy = false;
+          processingVisible = false;
+        });
+        processingTimer?.cancel();
+        _scrollToBottom();
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          busy = false;
+          processingVisible = false;
+        });
+      }
+      processingTimer?.cancel();
+      rethrow;
+    }
+  }
+
+  void _showProcessing() {
+    processingTimer?.cancel();
+    setState(() => processingVisible = true);
+    processingTimer = Timer(const Duration(seconds: 10), () {
+      if (mounted) {
+        setState(() => processingVisible = false);
+      }
+    });
+  }
+
+  void _scrollToBottom({bool jump = false}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!scrollController.hasClients) {
+        return;
+      }
+      final target = scrollController.position.maxScrollExtent;
+      if (jump) {
+        scrollController.jumpTo(target);
+      } else {
+        scrollController.animateTo(
+          target,
+          duration: const Duration(milliseconds: 260),
+          curve: Curves.easeOutCubic,
+        );
+      }
+    });
   }
 }
 
@@ -1114,12 +1670,14 @@ class ChatComposer extends StatelessWidget {
   const ChatComposer({
     required this.controller,
     required this.busy,
+    required this.enterSendsReply,
     required this.onSend,
     super.key,
   });
 
   final TextEditingController controller;
   final bool busy;
+  final bool enterSendsReply;
   final VoidCallback onSend;
 
   @override
@@ -1129,12 +1687,29 @@ class ChatComposer extends StatelessWidget {
       child: Row(
         children: [
           Expanded(
-            child: TextField(
-              controller: controller,
-              minLines: 1,
-              maxLines: 4,
-              decoration: const InputDecoration(labelText: 'Reply'),
-              onSubmitted: (_) => onSend(),
+            child: Focus(
+              onKeyEvent: (node, event) {
+                if (!enterSendsReply || event is! KeyDownEvent) {
+                  return KeyEventResult.ignored;
+                }
+                if (event.logicalKey == LogicalKeyboardKey.enter &&
+                    !HardwareKeyboard.instance.isShiftPressed) {
+                  onSend();
+                  return KeyEventResult.handled;
+                }
+                return KeyEventResult.ignored;
+              },
+              child: TextField(
+                controller: controller,
+                minLines: 1,
+                maxLines: 4,
+                keyboardType: TextInputType.multiline,
+                textInputAction: enterSendsReply
+                    ? TextInputAction.send
+                    : TextInputAction.newline,
+                decoration: const InputDecoration(labelText: 'Reply'),
+                onSubmitted: enterSendsReply ? (_) => onSend() : null,
+              ),
             ),
           ),
           const SizedBox(width: 8),
@@ -1156,29 +1731,98 @@ class ChatComposer extends StatelessWidget {
 }
 
 class ChatBubble extends StatelessWidget {
-  const ChatBubble({required this.message, super.key});
+  const ChatBubble({
+    required this.message,
+    required this.userAvatarBytes,
+    super.key,
+  });
 
   final ChatMessage message;
+  final Uint8List? userAvatarBytes;
 
   @override
   Widget build(BuildContext context) {
     final isUser = message.role == ChatRole.user;
+    final avatar = ProfileAvatar(
+      phase: message.phase,
+      isUser: isUser,
+      userAvatarBytes: userAvatarBytes,
+    );
+    final bubble = ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 720),
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 10),
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: isUser
+              ? Theme.of(context).colorScheme.primaryContainer
+              : Theme.of(context).colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: MarkdownText(message.bodyMarkdown),
+      ),
+    );
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 720),
-        child: Container(
-          margin: const EdgeInsets.only(bottom: 10),
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: isUser
-                ? Theme.of(context).colorScheme.primaryContainer
-                : Theme.of(context).colorScheme.surfaceContainerHighest,
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: MarkdownText(message.bodyMarkdown),
-        ),
+      child: Row(
+        mainAxisAlignment: isUser
+            ? MainAxisAlignment.end
+            : MainAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (!isUser) ...[avatar, const SizedBox(width: 8)],
+          Flexible(child: bubble),
+          if (isUser) ...[const SizedBox(width: 8), avatar],
+        ],
       ),
+    );
+  }
+}
+
+class ProfileAvatar extends StatelessWidget {
+  const ProfileAvatar({
+    required this.phase,
+    required this.isUser,
+    required this.userAvatarBytes,
+    super.key,
+  });
+
+  final Phase phase;
+  final bool isUser;
+  final Uint8List? userAvatarBytes;
+
+  @override
+  Widget build(BuildContext context) {
+    ImageProvider image;
+    if (isUser && userAvatarBytes != null) {
+      image = MemoryImage(userAvatarBytes!);
+    } else if (isUser) {
+      image = const AssetImage('assets/profile/user_placeholder.png');
+    } else if (phase == Phase.curiosity) {
+      image = const AssetImage('assets/profile/curiosity_placeholder.png');
+    } else {
+      image = const AssetImage('assets/profile/interlocutor_placeholder.png');
+    }
+    return CircleAvatar(
+      radius: 24,
+      backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
+      backgroundImage: image,
+    );
+  }
+}
+
+class AvatarPreview extends StatelessWidget {
+  const AvatarPreview({required this.userAvatarBytes, super.key});
+
+  final Uint8List? userAvatarBytes;
+
+  @override
+  Widget build(BuildContext context) {
+    return CircleAvatar(
+      radius: 22,
+      backgroundImage: userAvatarBytes == null
+          ? const AssetImage('assets/profile/user_placeholder.png')
+          : MemoryImage(userAvatarBytes!) as ImageProvider,
     );
   }
 }
@@ -1285,9 +1929,23 @@ class DiaryPage extends StatelessWidget {
 }
 
 class SettingsPage extends StatelessWidget {
-  const SettingsPage({required this.userName, required this.onLogs, super.key});
+  const SettingsPage({
+    required this.userName,
+    required this.userAvatarBytes,
+    required this.enterSendsReply,
+    required this.showEnterKeySetting,
+    required this.onPickAvatar,
+    required this.onEnterSendsReplyChanged,
+    required this.onLogs,
+    super.key,
+  });
 
   final String userName;
+  final Uint8List? userAvatarBytes;
+  final bool enterSendsReply;
+  final bool showEnterKeySetting;
+  final VoidCallback onPickAvatar;
+  final ValueChanged<bool> onEnterSendsReplyChanged;
   final VoidCallback onLogs;
 
   @override
@@ -1297,9 +1955,14 @@ class SettingsPage extends StatelessWidget {
       padding: const EdgeInsets.all(16),
       children: [
         ListTile(
-          leading: const Icon(Icons.person_rounded),
+          leading: AvatarPreview(userAvatarBytes: userAvatarBytes),
           title: const Text('User'),
           subtitle: Text(userName),
+          trailing: IconButton(
+            tooltip: 'Upload profile picture',
+            icon: const Icon(Icons.photo_camera_rounded),
+            onPressed: onPickAvatar,
+          ),
         ),
         const ListTile(
           leading: Icon(Icons.dns_rounded),
@@ -1313,6 +1976,18 @@ class SettingsPage extends StatelessWidget {
           trailing: const Icon(Icons.chevron_right_rounded),
           onTap: onLogs,
         ),
+        if (showEnterKeySetting)
+          SwitchListTile(
+            value: enterSendsReply,
+            onChanged: onEnterSendsReplyChanged,
+            title: const Text('Enter shortcut'),
+            subtitle: Text(
+              enterSendsReply
+                  ? 'Shift+Enter inserts a newline'
+                  : 'Enter inserts a newline',
+            ),
+            secondary: const Icon(Icons.keyboard_return_rounded),
+          ),
         SwitchListTile(
           value: true,
           onChanged: (_) {},

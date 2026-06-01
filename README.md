@@ -2,7 +2,9 @@
 
 Flutter client for Curiosity targeting Windows, Android, and Web.
 
-The current UI uses a mock lesson `CuriosityApi` implementation in `lib/main.dart`, so lesson flows are usable before the full REST client is wired to the FastAPI backend. The Logs page already calls the backend `GET /api/logs` endpoint when opened. The backend API contract is documented in `../docs/architecture_plan.md`.
+The app uses the FastAPI backend by default through `RestCuriosityApi` in `lib/main.dart`. A mock `CuriosityApi` remains available for offline UI testing with `--dart-define=USE_MOCK_API=true`. The backend API contract is documented in `../docs/architecture_plan.md`.
+
+Platform-specific UI notes are tracked in `../docs/platform_differences.md`.
 
 ## Development Testing
 
@@ -12,8 +14,8 @@ The current UI uses a mock lesson `CuriosityApi` implementation in `lib/main.dar
 - For Windows desktop: Visual Studio with the Desktop development with C++ workload.
 - For Android: Android Studio, Android SDK, and an emulator or physical device.
 - For browser: Chrome or Edge.
-- No backend credentials are required while the mock lesson API is active.
-- To view backend logs in the frontend Logs page, run the backend locally and pass `API_BASE_URL`.
+- No frontend credentials are required. The first launch creates a backend user from the entered alphabetic name.
+- Run the backend locally before using the default REST client.
 
 ### Test account
 
@@ -41,6 +43,12 @@ flutter pub get
 ```powershell
 cd frontend
 flutter run -d windows --dart-define=API_BASE_URL=http://127.0.0.1:8000/api
+```
+
+Offline mock mode:
+
+```powershell
+flutter run -d windows --dart-define=USE_MOCK_API=true
 ```
 
 ### Run in a browser
@@ -94,9 +102,9 @@ flutter test
 flutter build web
 ```
 
-### Local backend and logs integration
+### Local backend integration
 
-The visible lesson flow currently uses `MockCuriosityApi`, but Logs pulls backend logs from `API_BASE_URL`.
+The visible lesson flow and Logs page use the backend when `USE_MOCK_API` is false.
 
 1. Run the backend:
 
@@ -125,6 +133,8 @@ $env:CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 ```
 
 5. Open `Settings` -> `Logs` in the frontend. Frontend logs have a yellow outline. Backend logs have a blue outline. The list is sorted newest first and capped at 200 entries.
+6. On Windows and browser builds, `Settings` includes an Enter key behavior toggle. Android hides this option.
+7. `Settings` also includes user profile picture upload for all targets.
 
 ## Deployment: Railway
 
@@ -222,12 +232,10 @@ flutter build web --dart-define=API_BASE_URL=https://YOUR-BACKEND-DOMAIN/api
 Ada
 ```
 
-8. Create a mock lesson from the Start page.
+8. Create a real backend lesson from the Start page.
 9. Open `Settings` -> `Logs` and confirm backend entries appear if the backend API URL is configured and reachable.
 
-### 5. Connect it to the backend later
-
-After the frontend uses the real lesson API:
+### 5. Backend connection checklist
 
 1. Deploy the backend first.
 2. Copy the backend public URL, ending in `/api`.
@@ -380,13 +388,11 @@ Then:
 
 1. Enter `Ada` when prompted for a name.
 2. Click `Start`.
-3. Create a mock lesson.
+3. Create a backend lesson.
 4. Open `Diary` and `Settings` from the top bar.
 5. Open `Settings` -> `Logs` and confirm frontend entries are visible. Backend entries require the backend URL used at build time to be reachable and allowed by CORS.
 
-### 7. Connect it to the backend later
-
-After a real lesson REST client is implemented:
+### 7. Rebuild for a different backend
 
 1. Deploy the backend and copy its public `/api` URL.
 2. Use the Flutter compile-time API base URL already supported by the app.
