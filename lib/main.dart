@@ -231,8 +231,37 @@ class DiaryEntry {
   }
 }
 
+class Account {
+  Account({
+    required this.id,
+    required this.username,
+    required this.email,
+    this.token,
+  });
+
+  final int id;
+  final String username;
+  final String email;
+  final String? token;
+
+  factory Account.fromJson(Map<String, dynamic> json, {String? token}) {
+    return Account(
+      id: json['id'] as int? ?? 0,
+      username:
+          json['username'] as String? ?? json['name'] as String? ?? 'User',
+      email: json['email'] as String? ?? '',
+      token: token,
+    );
+  }
+}
+
 abstract class CuriosityApi {
-  Future<String> createUser(String name);
+  Future<Account?> restoreSession();
+  Future<Account> register(String username, String email, String password);
+  Future<Account> login(String email, String password);
+  Future<Account> updateAccount({String? username, String? email});
+  Future<void> updatePassword(String currentPassword, String newPassword);
+  Future<void> logout();
   Future<List<Lesson>> listLessons();
   Future<Lesson> createLesson(String topic, String interlocutor);
   Future<List<ChatMessage>> listMessages(int lessonId, Phase phase);
@@ -260,14 +289,86 @@ class RestCuriosityApi implements CuriosityApi {
   final http.Client client;
   final Map<int, int> _currentQuestionByLesson = {};
   int? _userId;
+  String? _token;
 
   @override
-  Future<String> createUser(String name) async {
-    final json = await _post('/users', {'name': name.trim()});
-    _userId = json['id'] as int?;
-    final createdName = json['name'] as String? ?? name.trim();
-    logger.info('Created backend user $_userId');
-    return createdName;
+  Future<Account?> restoreSession() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString('auth_token');
+    if (token == null || token.isEmpty) {
+      return null;
+    }
+    _token = token;
+    try {
+      final json = await _getObject('/users/me');
+      return _storeAccount(Account.fromJson(json, token: token));
+    } catch (exception) {
+      logger.warning('Stored session was not accepted: $exception');
+      await logout();
+      return null;
+    }
+  }
+
+  @override
+  Future<Account> register(
+    String username,
+    String email,
+    String password,
+  ) async {
+    final json = await _post('/auth/register', {
+      'username': username.trim(),
+      'email': email.trim(),
+      'password': password,
+    });
+    final account = _accountFromAuth(json);
+    logger.info('Registered backend user ${account.id}');
+    return account;
+  }
+
+  @override
+  Future<Account> login(String email, String password) async {
+    final json = await _post('/auth/login', {
+      'email': email.trim(),
+      'password': password,
+    });
+    final account = _accountFromAuth(json);
+    logger.info('Logged in backend user ${account.id}');
+    return account;
+  }
+
+  @override
+  Future<Account> updateAccount({String? username, String? email}) async {
+    final json = await _patch('/users/me', {
+      if (username != null) 'username': username.trim(),
+      if (email != null) 'email': email.trim(),
+    });
+    final account = _storeAccount(Account.fromJson(json, token: _token));
+    logger.info('Updated backend account ${account.id}');
+    return account;
+  }
+
+  @override
+  Future<void> updatePassword(
+    String currentPassword,
+    String newPassword,
+  ) async {
+    await _patch('/users/me/password', {
+      'current_password': currentPassword,
+      'new_password': newPassword,
+    });
+    logger.info('Updated backend account password');
+  }
+
+  @override
+  Future<void> logout() async {
+    _token = null;
+    _userId = null;
+    _currentQuestionByLesson.clear();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('auth_token');
+    await prefs.remove('auth_user_id');
+    await prefs.remove('auth_username');
+    await prefs.remove('auth_email');
   }
 
   @override
@@ -455,7 +556,21 @@ class RestCuriosityApi implements CuriosityApi {
     final response = await client
         .post(
           Uri.parse('$backendBaseUrl$path'),
-          headers: {'Content-Type': 'application/json'},
+          headers: _headers,
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 60));
+    return _decodeObject(response);
+  }
+
+  Future<Map<String, dynamic>> _patch(
+    String path,
+    Map<String, dynamic> body,
+  ) async {
+    final response = await client
+        .patch(
+          Uri.parse('$backendBaseUrl$path'),
+          headers: _headers,
           body: jsonEncode(body),
         )
         .timeout(const Duration(seconds: 60));
@@ -465,7 +580,7 @@ class RestCuriosityApi implements CuriosityApi {
   Future<List<dynamic>> _getList(String path, {bool logErrors = true}) async {
     try {
       final response = await client
-          .get(Uri.parse('$backendBaseUrl$path'))
+          .get(Uri.parse('$backendBaseUrl$path'), headers: _headers)
           .timeout(const Duration(seconds: 10));
       final decoded = _decode(response);
       if (decoded is List<dynamic>) {
@@ -478,6 +593,13 @@ class RestCuriosityApi implements CuriosityApi {
       }
       rethrow;
     }
+  }
+
+  Future<Map<String, dynamic>> _getObject(String path) async {
+    final response = await client
+        .get(Uri.parse('$backendBaseUrl$path'), headers: _headers)
+        .timeout(const Duration(seconds: 10));
+    return _decodeObject(response);
   }
 
   Map<String, dynamic> _decodeObject(http.Response response) {
@@ -503,6 +625,31 @@ class RestCuriosityApi implements CuriosityApi {
     }
     return jsonDecode(response.body);
   }
+
+  Map<String, String> get _headers => {
+    'Content-Type': 'application/json',
+    if (_token != null) 'Authorization': 'Bearer $_token',
+  };
+
+  Account _accountFromAuth(Map<String, dynamic> json) {
+    final token = json['token'] as String? ?? '';
+    final rawUser = json['user'] as Map<String, dynamic>;
+    return _storeAccount(Account.fromJson(rawUser, token: token));
+  }
+
+  Account _storeAccount(Account account) {
+    _userId = account.id;
+    _token = account.token ?? _token;
+    SharedPreferences.getInstance().then((prefs) {
+      if (_token != null) {
+        prefs.setString('auth_token', _token!);
+      }
+      prefs.setInt('auth_user_id', account.id);
+      prefs.setString('auth_username', account.username);
+      prefs.setString('auth_email', account.email);
+    });
+    return account;
+  }
 }
 
 class MockCuriosityApi implements CuriosityApi {
@@ -516,7 +663,17 @@ class MockCuriosityApi implements CuriosityApi {
 
   final FrontendLogger logger;
   final String backendBaseUrl;
-  String? _userName;
+  Account? _account;
+  final Map<String, Account> _accounts = {
+    'tester@example.com': Account(
+      id: 1,
+      username: 'tester',
+      email: 'tester@example.com',
+      token: 'mock-token',
+    ),
+  };
+  final Map<String, String> _passwords = {'tester@example.com': 'curious'};
+  int _nextUserId = 2;
   int _nextLessonId = 1;
   int _nextMessageId = 1;
   int _nextQuestionId = 1;
@@ -526,21 +683,99 @@ class MockCuriosityApi implements CuriosityApi {
   final Map<int, List<ComprehensionQuestion>> _questions = {};
 
   @override
-  Future<String> createUser(String name) async {
-    final cleaned = name.trim();
-    if (!RegExp(r'^[A-Za-z]+$').hasMatch(cleaned)) {
-      throw ArgumentError('Name must contain alphabetic characters only.');
+  Future<Account?> restoreSession() async => _account;
+
+  @override
+  Future<Account> register(
+    String username,
+    String email,
+    String password,
+  ) async {
+    _validateAccount(username, email, password);
+    final key = email.trim().toLowerCase();
+    if (_accounts.containsKey(key)) {
+      throw ArgumentError('Email already exists');
     }
-    _userName = cleaned;
-    logger.info('Created local test user $cleaned');
-    return cleaned;
+    final account = Account(
+      id: _nextUserId++,
+      username: username.trim(),
+      email: key,
+      token: 'mock-token-$key',
+    );
+    _accounts[key] = account;
+    _passwords[key] = password;
+    _account = account;
+    logger.info('Registered local test user ${account.email}');
+    return account;
   }
 
   @override
-  Future<List<Lesson>> listLessons() async => List.unmodifiable(_lessons);
+  Future<Account> login(String email, String password) async {
+    final key = email.trim().toLowerCase();
+    final account = _accounts[key];
+    if (account == null || _passwords[key] != password) {
+      throw ArgumentError('Invalid email or password');
+    }
+    _account = account;
+    logger.info('Logged in local test user ${account.email}');
+    return account;
+  }
+
+  @override
+  Future<Account> updateAccount({String? username, String? email}) async {
+    final current = _requireAccount();
+    final nextUsername = username?.trim() ?? current.username;
+    final nextEmail = email?.trim().toLowerCase() ?? current.email;
+    _validateAccount(
+      nextUsername,
+      nextEmail,
+      _passwords[current.email] ?? 'curious',
+    );
+    if (nextEmail != current.email && _accounts.containsKey(nextEmail)) {
+      throw ArgumentError('Email already exists');
+    }
+    _accounts.remove(current.email);
+    final updated = Account(
+      id: current.id,
+      username: nextUsername,
+      email: nextEmail,
+      token: current.token,
+    );
+    _accounts[nextEmail] = updated;
+    _passwords[nextEmail] = _passwords.remove(current.email) ?? 'curious';
+    _account = updated;
+    return updated;
+  }
+
+  @override
+  Future<void> updatePassword(
+    String currentPassword,
+    String newPassword,
+  ) async {
+    final account = _requireAccount();
+    if (_passwords[account.email] != currentPassword) {
+      throw ArgumentError('Current password is incorrect');
+    }
+    if (newPassword.length < 5) {
+      throw ArgumentError('Password must be at least 5 characters');
+    }
+    _passwords[account.email] = newPassword;
+  }
+
+  @override
+  Future<void> logout() async {
+    _account = null;
+  }
+
+  @override
+  Future<List<Lesson>> listLessons() async {
+    _requireAccount();
+    return List.unmodifiable(_lessons);
+  }
 
   @override
   Future<Lesson> createLesson(String topic, String interlocutor) async {
+    _requireAccount();
     final now = DateTime.now();
     final lesson = Lesson(
       id: _nextLessonId++,
@@ -682,7 +917,8 @@ class MockCuriosityApi implements CuriosityApi {
 
   @override
   Future<List<DiaryEntry>> listDiary() async {
-    if (_diary.isEmpty && _userName != null) {
+    _requireAccount();
+    if (_diary.isEmpty && _account != null) {
       _diary.add(
         DiaryEntry(
           id: 1,
@@ -693,6 +929,28 @@ class MockCuriosityApi implements CuriosityApi {
       );
     }
     return List.unmodifiable(_diary);
+  }
+
+  Account _requireAccount() {
+    final account = _account;
+    if (account == null) {
+      throw StateError('Sign in before using Curiosity.');
+    }
+    return account;
+  }
+
+  void _validateAccount(String username, String email, String password) {
+    final cleanUsername = username.trim();
+    final cleanEmail = email.trim().toLowerCase();
+    if (cleanUsername.isEmpty || cleanUsername.length > 20) {
+      throw ArgumentError('Username must be between 1 and 20 characters');
+    }
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(cleanEmail)) {
+      throw ArgumentError('Email must be a valid email address');
+    }
+    if (password.length < 5) {
+      throw ArgumentError('Password must be at least 5 characters');
+    }
   }
 
   @override
@@ -860,14 +1118,13 @@ class CuriosityShell extends StatefulWidget {
 }
 
 class _CuriosityShellState extends State<CuriosityShell> {
-  String? userName;
+  Account? account;
   String activePage = 'home';
   Lesson? selectedLesson;
   List<Lesson> lessons = [];
   List<DiaryEntry> diary = [];
   Uint8List? userAvatarBytes;
   String? error;
-  bool askedForName = false;
   bool enterSendsReply = true;
 
   @override
@@ -878,6 +1135,15 @@ class _CuriosityShellState extends State<CuriosityShell> {
   }
 
   Future<void> _load() async {
+    if (account == null) {
+      final restored = await widget.api.restoreSession();
+      if (mounted && restored != null) {
+        setState(() => account = restored);
+      }
+    }
+    if (account == null) {
+      return;
+    }
     lessons = await widget.api.listLessons();
     diary = await widget.api.listDiary();
     if (mounted) {
@@ -887,13 +1153,6 @@ class _CuriosityShellState extends State<CuriosityShell> {
 
   @override
   Widget build(BuildContext context) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!askedForName && userName == null) {
-        askedForName = true;
-        _showNameDialog();
-      }
-    });
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('Curiosity'),
@@ -941,6 +1200,13 @@ class _CuriosityShellState extends State<CuriosityShell> {
   }
 
   Widget _page() {
+    if (account == null) {
+      return AuthPage(
+        onLogin: _login,
+        onRegister: _register,
+        onUseTestAccount: () => _login('tester@example.com', 'curious'),
+      );
+    }
     return switch (activePage) {
       'create' => CreateLessonPage(onCreate: _createLesson),
       'history' => HistoryPage(lessons: lessons, onOpen: _openLesson),
@@ -953,17 +1219,21 @@ class _CuriosityShellState extends State<CuriosityShell> {
       ),
       'diary' => DiaryPage(entries: diary),
       'settings' => SettingsPage(
-        userName: userName ?? 'Guest',
+        account: account!,
         userAvatarBytes: userAvatarBytes,
         enterSendsReply: enterSendsReply,
         showEnterKeySetting: _supportsEnterKeySetting,
         onPickAvatar: _pickUserAvatar,
+        onEditUsername: _showEditUsernameDialog,
+        onEditEmail: _showEditEmailDialog,
+        onEditPassword: _showEditPasswordDialog,
+        onLogout: _logout,
         onEnterSendsReplyChanged: _setEnterSendsReply,
         onLogs: () => _go('logs'),
       ),
       'logs' => LogsPage(api: widget.api, logger: widget.logger),
       _ => HomePage(
-        userName: userName ?? 'Guest',
+        userName: account!.username,
         lessonCount: lessons.length,
         attentionCount: lessons.where((lesson) => lesson.needsAttention).length,
         onStart: () => _go('create'),
@@ -975,6 +1245,10 @@ class _CuriosityShellState extends State<CuriosityShell> {
   }
 
   void _go(String page) {
+    if (account == null) {
+      setState(() => activePage = 'home');
+      return;
+    }
     setState(() => activePage = page);
     if (page == 'home' || page == 'history' || page == 'diary') {
       _load();
@@ -993,6 +1267,50 @@ class _CuriosityShellState extends State<CuriosityShell> {
       widget.logger.error('Create lesson failed: $exception');
       setState(() => error = exception.toString());
     }
+  }
+
+  Future<void> _login(String email, String password) async {
+    try {
+      final signedIn = await widget.api.login(email, password);
+      await _setAccount(signedIn);
+    } catch (exception) {
+      widget.logger.warning('Login failed: $exception');
+      setState(() => error = exception.toString());
+    }
+  }
+
+  Future<void> _register(String username, String email, String password) async {
+    try {
+      final created = await widget.api.register(username, email, password);
+      await _setAccount(created);
+    } catch (exception) {
+      widget.logger.warning('Registration failed: $exception');
+      setState(() => error = exception.toString());
+    }
+  }
+
+  Future<void> _setAccount(Account value) async {
+    account = value;
+    lessons = await widget.api.listLessons();
+    diary = await widget.api.listDiary();
+    if (mounted) {
+      setState(() {
+        account = value;
+        activePage = 'home';
+        error = null;
+      });
+    }
+  }
+
+  Future<void> _logout() async {
+    await widget.api.logout();
+    setState(() {
+      account = null;
+      lessons = [];
+      diary = [];
+      selectedLesson = null;
+      activePage = 'home';
+    });
   }
 
   void _openLesson(Lesson lesson) {
@@ -1068,25 +1386,29 @@ class _CuriosityShellState extends State<CuriosityShell> {
     }
   }
 
-  Future<void> _showNameDialog() async {
-    final controller = TextEditingController();
+  Future<void> _showEditUsernameDialog() async {
+    final controller = TextEditingController(text: account?.username ?? '');
     await showDialog<void>(
       context: context,
-      barrierDismissible: false,
       builder: (context) {
         return AlertDialog(
-          title: const Text('Welcome'),
+          title: const Text('Username'),
           content: TextField(
             controller: controller,
             autofocus: true,
-            decoration: const InputDecoration(labelText: 'Name'),
+            maxLength: 20,
+            decoration: const InputDecoration(labelText: 'Username'),
             textInputAction: TextInputAction.done,
-            onSubmitted: (_) => _saveName(controller),
+            onSubmitted: (_) => _updateUsername(controller.text),
           ),
           actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
             FilledButton(
-              onPressed: () => _saveName(controller),
-              child: const Text('Continue'),
+              onPressed: () => _updateUsername(controller.text),
+              child: const Text('Save'),
             ),
           ],
         );
@@ -1094,15 +1416,115 @@ class _CuriosityShellState extends State<CuriosityShell> {
     );
   }
 
-  Future<void> _saveName(TextEditingController controller) async {
+  Future<void> _showEditEmailDialog() async {
+    final controller = TextEditingController(text: account?.email ?? '');
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Email'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'Email'),
+            keyboardType: TextInputType.emailAddress,
+            textInputAction: TextInputAction.done,
+            onSubmitted: (_) => _updateEmail(controller.text),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => _updateEmail(controller.text),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _showEditPasswordDialog() async {
+    final current = TextEditingController();
+    final next = TextEditingController();
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Password'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: current,
+                autofocus: true,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Current password',
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: next,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'New password'),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => _updatePassword(current.text, next.text),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _updateUsername(String username) async {
     try {
-      final name = await widget.api.createUser(controller.text);
+      final updated = await widget.api.updateAccount(username: username);
       if (mounted) {
         Navigator.of(context).pop();
-        setState(() => userName = name);
+        setState(() => account = updated);
       }
     } catch (exception) {
-      widget.logger.warning('Name validation failed: $exception');
+      widget.logger.warning('Username update failed: $exception');
+      setState(() => error = exception.toString());
+    }
+  }
+
+  Future<void> _updateEmail(String email) async {
+    try {
+      final updated = await widget.api.updateAccount(email: email);
+      if (mounted) {
+        Navigator.of(context).pop();
+        setState(() => account = updated);
+      }
+    } catch (exception) {
+      widget.logger.warning('Email update failed: $exception');
+      setState(() => error = exception.toString());
+    }
+  }
+
+  Future<void> _updatePassword(
+    String currentPassword,
+    String newPassword,
+  ) async {
+    try {
+      await widget.api.updatePassword(currentPassword, newPassword);
+      if (mounted) {
+        Navigator.of(context).pop();
+      }
+    } catch (exception) {
+      widget.logger.warning('Password update failed: $exception');
       setState(() => error = exception.toString());
     }
   }
@@ -1122,6 +1544,131 @@ class _TopAction extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return IconButton(tooltip: label, icon: Icon(icon), onPressed: onPressed);
+  }
+}
+
+class AuthPage extends StatefulWidget {
+  const AuthPage({
+    required this.onLogin,
+    required this.onRegister,
+    required this.onUseTestAccount,
+    super.key,
+  });
+
+  final Future<void> Function(String email, String password) onLogin;
+  final Future<void> Function(String username, String email, String password)
+  onRegister;
+  final Future<void> Function() onUseTestAccount;
+
+  @override
+  State<AuthPage> createState() => _AuthPageState();
+}
+
+class _AuthPageState extends State<AuthPage> {
+  final username = TextEditingController();
+  final email = TextEditingController(text: 'tester@example.com');
+  final password = TextEditingController(text: 'curious');
+  bool registering = false;
+  bool busy = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      key: const ValueKey('auth'),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 440),
+        child: ListView(
+          shrinkWrap: true,
+          padding: const EdgeInsets.all(24),
+          children: [
+            SegmentedButton<bool>(
+              segments: const [
+                ButtonSegment(
+                  value: false,
+                  icon: Icon(Icons.login_rounded),
+                  label: Text('Sign in'),
+                ),
+                ButtonSegment(
+                  value: true,
+                  icon: Icon(Icons.person_add_rounded),
+                  label: Text('Create'),
+                ),
+              ],
+              selected: {registering},
+              onSelectionChanged: busy
+                  ? null
+                  : (value) => setState(() => registering = value.first),
+            ),
+            const SizedBox(height: 16),
+            if (registering) ...[
+              TextField(
+                controller: username,
+                maxLength: 20,
+                decoration: const InputDecoration(labelText: 'Username'),
+                textInputAction: TextInputAction.next,
+              ),
+              const SizedBox(height: 12),
+            ],
+            TextField(
+              controller: email,
+              decoration: const InputDecoration(labelText: 'Email'),
+              keyboardType: TextInputType.emailAddress,
+              textInputAction: TextInputAction.next,
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: password,
+              decoration: const InputDecoration(labelText: 'Password'),
+              obscureText: true,
+              textInputAction: TextInputAction.done,
+              onSubmitted: (_) => _submit(),
+            ),
+            const SizedBox(height: 20),
+            FilledButton.icon(
+              icon: busy
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Icon(
+                      registering
+                          ? Icons.person_add_rounded
+                          : Icons.login_rounded,
+                    ),
+              label: Text(registering ? 'Create account' : 'Sign in'),
+              onPressed: busy ? null : _submit,
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.science_rounded),
+              label: const Text('Use test account'),
+              onPressed: busy ? null : _useTestAccount,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _submit() async {
+    setState(() => busy = true);
+    if (registering) {
+      await widget.onRegister(username.text, email.text, password.text);
+    } else {
+      await widget.onLogin(email.text, password.text);
+    }
+    if (mounted) {
+      setState(() => busy = false);
+    }
+  }
+
+  Future<void> _useTestAccount() async {
+    setState(() => busy = true);
+    await widget.onUseTestAccount();
+    if (mounted) {
+      setState(() => busy = false);
+    }
   }
 }
 
@@ -1930,21 +2477,29 @@ class DiaryPage extends StatelessWidget {
 
 class SettingsPage extends StatelessWidget {
   const SettingsPage({
-    required this.userName,
+    required this.account,
     required this.userAvatarBytes,
     required this.enterSendsReply,
     required this.showEnterKeySetting,
     required this.onPickAvatar,
+    required this.onEditUsername,
+    required this.onEditEmail,
+    required this.onEditPassword,
+    required this.onLogout,
     required this.onEnterSendsReplyChanged,
     required this.onLogs,
     super.key,
   });
 
-  final String userName;
+  final Account account;
   final Uint8List? userAvatarBytes;
   final bool enterSendsReply;
   final bool showEnterKeySetting;
   final VoidCallback onPickAvatar;
+  final VoidCallback onEditUsername;
+  final VoidCallback onEditEmail;
+  final VoidCallback onEditPassword;
+  final VoidCallback onLogout;
   final ValueChanged<bool> onEnterSendsReplyChanged;
   final VoidCallback onLogs;
 
@@ -1957,12 +2512,33 @@ class SettingsPage extends StatelessWidget {
         ListTile(
           leading: AvatarPreview(userAvatarBytes: userAvatarBytes),
           title: const Text('User'),
-          subtitle: Text(userName),
+          subtitle: Text(account.username),
           trailing: IconButton(
             tooltip: 'Upload profile picture',
             icon: const Icon(Icons.photo_camera_rounded),
             onPressed: onPickAvatar,
           ),
+        ),
+        ListTile(
+          leading: const Icon(Icons.badge_rounded),
+          title: const Text('Username'),
+          subtitle: Text(account.username),
+          trailing: const Icon(Icons.edit_rounded),
+          onTap: onEditUsername,
+        ),
+        ListTile(
+          leading: const Icon(Icons.alternate_email_rounded),
+          title: const Text('Email'),
+          subtitle: Text(account.email),
+          trailing: const Icon(Icons.edit_rounded),
+          onTap: onEditEmail,
+        ),
+        ListTile(
+          leading: const Icon(Icons.password_rounded),
+          title: const Text('Password'),
+          subtitle: const Text('Change password'),
+          trailing: const Icon(Icons.edit_rounded),
+          onTap: onEditPassword,
         ),
         const ListTile(
           leading: Icon(Icons.dns_rounded),
@@ -1993,6 +2569,11 @@ class SettingsPage extends StatelessWidget {
           onChanged: (_) {},
           title: const Text('Dark theme'),
           secondary: const Icon(Icons.dark_mode_rounded),
+        ),
+        ListTile(
+          leading: const Icon(Icons.logout_rounded),
+          title: const Text('Sign out'),
+          onTap: onLogout,
         ),
       ],
     );

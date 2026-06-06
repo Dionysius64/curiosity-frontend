@@ -9,5 +9,9 @@ RUN flutter build web --release --dart-define=API_BASE_URL=${API_BASE_URL}
 
 FROM caddy:2-alpine
 
+ENV PORT=8080
+
 COPY Caddyfile /etc/caddy/Caddyfile
 COPY --from=build /app/build/web /srv
+
+EXPOSE 8080

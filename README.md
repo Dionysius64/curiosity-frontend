@@ -14,20 +14,20 @@ Platform-specific UI notes are tracked in `../docs/platform_differences.md`.
 - For Windows desktop: Visual Studio with the Desktop development with C++ workload.
 - For Android: Android Studio, Android SDK, and an emulator or physical device.
 - For browser: Chrome or Edge.
-- No frontend credentials are required. The first launch creates a backend user from the entered alphabetic name.
+- A backend account is required. Local/dev backend startup seeds a reusable test account.
 - Run the backend locally before using the default REST client.
 
 ### Test account
 
-There is no password-based auth yet. On first launch the app asks for a name.
-
 Use:
 
 ```text
-Ada
+Email: tester@example.com
+Password: curious
+Username: tester
 ```
 
-Any alphabetic-only name works. Names with spaces, numbers, or punctuation are rejected to match the backend rule.
+The sign-in page also includes a `Use test account` button. New account creation rejects duplicate emails, invalid email format, usernames shorter than 1 or longer than 20 characters, and passwords shorter than 5 characters.
 
 ### Install dependencies
 
@@ -134,9 +134,11 @@ $env:CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 
 5. Open `Settings` -> `Logs` in the frontend. Frontend logs have a yellow outline. Backend logs have a blue outline. The list is sorted newest first and capped at 200 entries.
 6. On Windows and browser builds, `Settings` includes an Enter key behavior toggle. Android hides this option.
-7. `Settings` also includes user profile picture upload for all targets.
+7. `Settings` includes account editing, password changes, email changes, sign out, and user profile picture upload for all targets.
 
 ## Deployment: Railway
+
+For the combined frontend, backend, Postgres, and public URL handoff flow, see `../docs/railway_deployment.md`.
 
 References:
 
@@ -176,6 +178,7 @@ flutter build web
 ```
 
 The `try_files` rule is important for single-page app routing.
+4. Confirm `frontend/Dockerfile` exists. Railway should use Dockerfile builds for the frontend service.
 
 ### 2. Create the Railway service
 
@@ -226,10 +229,10 @@ flutter build web --dart-define=API_BASE_URL=https://YOUR-BACKEND-DOMAIN/api
 4. Find `Networking` -> `Public Networking`.
 5. Click `Generate Domain`.
 6. Open the generated Railway domain.
-7. Enter the test name:
+7. Sign in with the test account:
 
 ```text
-Ada
+tester@example.com / curious
 ```
 
 8. Create a real backend lesson from the Start page.
@@ -244,6 +247,8 @@ Ada
 5. Redeploy both services.
 
 ## Deployment: Azure Static Web Apps
+
+For the combined Azure backend, frontend, database, and public URL handoff flow, see `../docs/azure_deployment.md`.
 
 References:
 
@@ -386,7 +391,7 @@ https://YOUR_DEFAULT_HOSTNAME
 
 Then:
 
-1. Enter `Ada` when prompted for a name.
+1. Sign in with `tester@example.com` / `curious`.
 2. Click `Start`.
 3. Create a backend lesson.
 4. Open `Diary` and `Settings` from the top bar.
