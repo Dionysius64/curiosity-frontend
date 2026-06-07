@@ -48,25 +48,45 @@ class AppLogEntry {
     required this.id,
     required this.source,
     required this.label,
+    required this.severity,
+    required this.loggerName,
     required this.message,
     required this.timestamp,
+    this.attributes = const {},
   });
 
   final int id;
   final String source;
   final LogLabel label;
+  final LogLabel severity;
+  final String loggerName;
   final String message;
   final DateTime timestamp;
+  final Map<String, dynamic> attributes;
 
   factory AppLogEntry.fromBackendJson(Map<String, dynamic> json) {
+    final rawLevel =
+        json['label'] as String? ??
+        json['severity'] as String? ??
+        json['level'] as String? ??
+        'INFO';
+    final rawSeverity =
+        json['severity'] as String? ??
+        json['level'] as String? ??
+        json['label'] as String? ??
+        rawLevel;
+    final attributes = json['attributes'];
     return AppLogEntry(
       id: json['id'] as int? ?? 0,
       source: json['source'] as String? ?? 'backend',
-      label: LogLabel.fromValue(json['label'] as String? ?? 'INFO'),
+      label: LogLabel.fromValue(rawLevel),
+      severity: LogLabel.fromValue(rawSeverity),
+      loggerName: json['logger'] as String? ?? 'curiosity.backend',
       message: json['message'] as String? ?? '',
       timestamp:
           DateTime.tryParse(json['timestamp'] as String? ?? '') ??
           DateTime.now(),
+      attributes: attributes is Map<String, dynamic> ? attributes : const {},
     );
   }
 }
@@ -98,6 +118,8 @@ class FrontendLogger {
         id: _nextId++,
         source: 'frontend',
         label: label,
+        severity: label == LogLabel.exception ? LogLabel.error : label,
+        loggerName: 'curiosity.frontend',
         message: message,
         timestamp: DateTime.now(),
       ),
