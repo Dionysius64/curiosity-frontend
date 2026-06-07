@@ -36,8 +36,12 @@ enum LogLabel {
   final String value;
 
   static LogLabel fromValue(String value) {
+    final normalized = value.trim().toUpperCase();
+    if (normalized == 'WARN') {
+      return LogLabel.warning;
+    }
     return LogLabel.values.firstWhere(
-      (label) => label.value == value,
+      (label) => label.value == normalized,
       orElse: () => LogLabel.info,
     );
   }
