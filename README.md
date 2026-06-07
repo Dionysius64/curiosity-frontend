@@ -93,6 +93,16 @@ If multiple Android devices are listed, copy the device ID from `flutter devices
 flutter run -d YOUR_DEVICE_ID --dart-define=API_BASE_URL=http://10.0.2.2:8000/api
 ```
 
+Android push-device registration is Android-only. When you have an FCM registration token for the device, pass it to the build:
+
+```powershell
+flutter run -d android `
+  --dart-define=API_BASE_URL=http://10.0.2.2:8000/api `
+  --dart-define=ANDROID_FCM_TOKEN=YOUR_DEVICE_FCM_TOKEN
+```
+
+Windows, Chrome, Edge, and web-server targets ignore `ANDROID_FCM_TOKEN` and do not call the push registration API.
+
 ### Run automated checks
 
 ```powershell

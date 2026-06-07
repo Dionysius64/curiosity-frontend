@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -298,6 +299,12 @@ abstract class CuriosityApi {
   Future<List<ChatMessage>> startPhase(int lessonId, Phase phase);
   Future<List<DiaryEntry>> listDiary();
   Future<List<AppLogEntry>> listBackendLogs();
+  Future<void> registerPushDevice({
+    required String platform,
+    required String token,
+    required String installationId,
+  });
+  Future<void> unregisterPushDevice(String installationId);
 }
 
 class RestCuriosityApi implements CuriosityApi {
@@ -395,6 +402,26 @@ class RestCuriosityApi implements CuriosityApi {
     await prefs.remove('auth_user_id');
     await prefs.remove('auth_username');
     await prefs.remove('auth_email');
+  }
+
+  @override
+  Future<void> registerPushDevice({
+    required String platform,
+    required String token,
+    required String installationId,
+  }) async {
+    await _post('/devices', {
+      'platform': platform,
+      'token': token,
+      'installation_id': installationId,
+    });
+    logger.info('Registered backend $platform push device');
+  }
+
+  @override
+  Future<void> unregisterPushDevice(String installationId) async {
+    await _delete('/devices/${Uri.encodeComponent(installationId)}');
+    logger.info('Unregistered backend push device');
   }
 
   @override
@@ -601,6 +628,16 @@ class RestCuriosityApi implements CuriosityApi {
         )
         .timeout(const Duration(seconds: 60));
     return _decodeObject(response);
+  }
+
+  Future<void> _delete(String path) async {
+    final response = await client
+        .delete(Uri.parse('$backendBaseUrl$path'), headers: _headers)
+        .timeout(const Duration(seconds: 10));
+    if (response.statusCode == 204) {
+      return;
+    }
+    _decode(response);
   }
 
   Future<List<dynamic>> _getList(String path, {bool logErrors = true}) async {
@@ -1009,6 +1046,20 @@ class MockCuriosityApi implements CuriosityApi {
     }
   }
 
+  @override
+  Future<void> registerPushDevice({
+    required String platform,
+    required String token,
+    required String installationId,
+  }) async {
+    logger.debug('Mock push device registration skipped');
+  }
+
+  @override
+  Future<void> unregisterPushDevice(String installationId) async {
+    logger.debug('Mock push device unregister skipped');
+  }
+
   Lesson _lesson(int lessonId) =>
       _lessons.firstWhere((lesson) => lesson.id == lessonId);
 
@@ -1092,6 +1143,91 @@ Phase _phaseFromApi(String value) {
   };
 }
 
+class AndroidPushRegistrationCoordinator {
+  AndroidPushRegistrationCoordinator({
+    required this.api,
+    required this.logger,
+  });
+
+  static const String _androidFcmToken = String.fromEnvironment(
+    'ANDROID_FCM_TOKEN',
+  );
+  static const MethodChannel _channel = MethodChannel(
+    'curiosity.android/notifications',
+  );
+
+  final CuriosityApi api;
+  final FrontendLogger logger;
+
+  Future<void> registerIfAvailable() async {
+    if (!_supportsAndroidPush) {
+      return;
+    }
+    if (_androidFcmToken.trim().isEmpty) {
+      logger.warning(
+        'Android push registration skipped: ANDROID_FCM_TOKEN is not set.',
+      );
+      return;
+    }
+    final permissionGranted = await _requestNotificationPermission();
+    if (!permissionGranted) {
+      logger.warning('Android notification permission was not granted.');
+      return;
+    }
+    final installationId = await _installationId();
+    await api.registerPushDevice(
+      platform: 'android',
+      token: _androidFcmToken.trim(),
+      installationId: installationId,
+    );
+  }
+
+  Future<void> unregisterIfAvailable() async {
+    if (!_supportsAndroidPush) {
+      return;
+    }
+    final installationId = await _currentInstallationId();
+    if (installationId == null) {
+      return;
+    }
+    await api.unregisterPushDevice(installationId);
+  }
+
+  bool get _supportsAndroidPush {
+    return !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  }
+
+  Future<bool> _requestNotificationPermission() async {
+    try {
+      return await _channel.invokeMethod<bool>(
+            'requestPostNotificationsPermission',
+          ) ??
+          false;
+    } catch (exception) {
+      logger.warning('Android notification permission request failed: $exception');
+      return false;
+    }
+  }
+
+  Future<String> _installationId() async {
+    final existing = await _currentInstallationId();
+    if (existing != null) {
+      return existing;
+    }
+    final bytes = List<int>.generate(18, (_) => Random.secure().nextInt(256));
+    final created = base64UrlEncode(bytes).replaceAll('=', '');
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('push_installation_id', created);
+    return created;
+  }
+
+  Future<String?> _currentInstallationId() async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getString('push_installation_id');
+    return value == null || value.isEmpty ? null : value;
+  }
+}
+
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
@@ -1152,10 +1288,15 @@ class _CuriosityShellState extends State<CuriosityShell> {
   Uint8List? userAvatarBytes;
   String? error;
   bool enterSendsReply = true;
+  late final AndroidPushRegistrationCoordinator pushRegistration;
 
   @override
   void initState() {
     super.initState();
+    pushRegistration = AndroidPushRegistrationCoordinator(
+      api: widget.api,
+      logger: widget.logger,
+    );
     _load();
     _loadLocalSettings();
   }
@@ -1165,6 +1306,7 @@ class _CuriosityShellState extends State<CuriosityShell> {
       final restored = await widget.api.restoreSession();
       if (mounted && restored != null) {
         setState(() => account = restored);
+        await _registerPushDevice();
       }
     }
     if (account == null) {
@@ -1317,6 +1459,7 @@ class _CuriosityShellState extends State<CuriosityShell> {
 
   Future<void> _setAccount(Account value) async {
     account = value;
+    await _registerPushDevice();
     lessons = await widget.api.listLessons();
     diary = await widget.api.listDiary();
     if (mounted) {
@@ -1329,6 +1472,7 @@ class _CuriosityShellState extends State<CuriosityShell> {
   }
 
   Future<void> _logout() async {
+    await _unregisterPushDevice();
     await widget.api.logout();
     setState(() {
       account = null;
@@ -1337,6 +1481,22 @@ class _CuriosityShellState extends State<CuriosityShell> {
       selectedLesson = null;
       activePage = 'home';
     });
+  }
+
+  Future<void> _registerPushDevice() async {
+    try {
+      await pushRegistration.registerIfAvailable();
+    } catch (exception) {
+      widget.logger.warning('Push device registration failed: $exception');
+    }
+  }
+
+  Future<void> _unregisterPushDevice() async {
+    try {
+      await pushRegistration.unregisterIfAvailable();
+    } catch (exception) {
+      widget.logger.warning('Push device unregister failed: $exception');
+    }
   }
 
   void _openLesson(Lesson lesson) {
