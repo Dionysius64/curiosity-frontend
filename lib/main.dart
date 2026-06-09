@@ -186,8 +186,8 @@ class Lesson {
   final String interlocutor;
   final String title;
   final DateTime createdAt;
-  final DateTime? refresherDueAt;
-  final DateTime? curiosityDueAt;
+  DateTime? refresherDueAt;
+  DateTime? curiosityDueAt;
   bool refresherAvailable;
   bool curiosityAvailable;
   bool refresherStarted;
@@ -491,6 +491,16 @@ class RestCuriosityApi implements CuriosityApi {
       lessonId,
       json['questions'] as List<dynamic>? ?? [],
     );
+    final lessonJson = json['lesson'];
+    if (lessonJson is Map<String, dynamic>) {
+      final lesson = Lesson.fromJson(lessonJson);
+      final dueAt = lesson.refresherDueAt;
+      if (dueAt != null && dueAt.isAfter(DateTime.now())) {
+        logger.info(
+          'Lesson $lessonId Refresher due in ${_durationLabel(dueAt.difference(DateTime.now()))}',
+        );
+      }
+    }
     final assistant = json['assistant_message'];
     logger.info('Started backend comprehension questions for lesson $lessonId');
     return assistant is Map<String, dynamic>
@@ -900,6 +910,8 @@ class MockCuriosityApi implements CuriosityApi {
   @override
   Future<List<ChatMessage>> startQuestions(int lessonId) async {
     final lesson = _lesson(lessonId);
+    final refresherDueAt = DateTime.now().add(const Duration(hours: 12));
+    lesson.refresherDueAt ??= refresherDueAt;
     _questions.putIfAbsent(
       lessonId,
       () => [
@@ -919,6 +931,9 @@ class MockCuriosityApi implements CuriosityApi {
       ],
     );
     lesson.refresherAvailable = true;
+    logger.info(
+      'Lesson $lessonId Refresher due in ${_durationLabel(lesson.refresherDueAt!.difference(DateTime.now()))}',
+    );
     logger.info('Started mock comprehension questions for lesson $lessonId');
     final first = _questions[lessonId]!.firstWhere(
       (question) => question.answer == null,
