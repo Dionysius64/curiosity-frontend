@@ -143,8 +143,11 @@ $env:CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 ```
 
 5. Open `Settings` -> `Logs` in the frontend. Frontend logs have a yellow outline. Backend logs have a blue outline. The list is sorted newest first and capped at 200 entries.
-6. On Windows and browser builds, `Settings` includes an Enter key behavior toggle. Android hides this option.
-7. `Settings` includes account editing, password changes, email changes, sign out, and user profile picture upload for all targets.
+6. Tap a log row to open a detail page with the full message text, metadata, and structured attributes.
+7. Long-press any chat bubble to copy its markdown text. A small top popup confirms the copy and disappears after 5 seconds.
+8. On Android, the system back button returns to the Start page from any in-app page. Pressing it on Start keeps the platform default behavior.
+9. On Windows and browser builds, `Settings` includes an Enter key behavior toggle. Android hides this option.
+10. `Settings` includes account editing, password changes, email changes, sign out, and user profile picture upload for all targets.
 
 ## Deployment: Railway
 

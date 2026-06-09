@@ -172,6 +172,8 @@ class Lesson {
     required this.interlocutor,
     required this.title,
     required this.createdAt,
+    this.refresherDueAt,
+    this.curiosityDueAt,
     this.refresherAvailable = false,
     this.curiosityAvailable = false,
     this.refresherStarted = false,
@@ -184,6 +186,8 @@ class Lesson {
   final String interlocutor;
   final String title;
   final DateTime createdAt;
+  final DateTime? refresherDueAt;
+  final DateTime? curiosityDueAt;
   bool refresherAvailable;
   bool curiosityAvailable;
   bool refresherStarted;
@@ -201,6 +205,8 @@ class Lesson {
       createdAt:
           DateTime.tryParse(json['created_at'] as String? ?? '') ??
           DateTime.now(),
+      refresherDueAt: _optionalDate(json['refresher_due_at']),
+      curiosityDueAt: _optionalDate(json['curiosity_due_at']),
       refresherAvailable: json['refresher_available'] as bool? ?? false,
       curiosityAvailable: json['curiosity_available'] as bool? ?? false,
       refresherStarted: json['refresher_started_at'] != null,
@@ -472,7 +478,9 @@ class RestCuriosityApi implements CuriosityApi {
       for (final item in json['assistant_messages'] as List<dynamic>)
         ChatMessage.fromJson(item as Map<String, dynamic>),
     ];
-    logger.debug('Sent backend ${phase.label} message for lesson $lessonId');
+    logger.debug(
+      'Sent backend ${phase.label} message for lesson $lessonId (${body.trim().length} characters, ${messages.length} returned messages)',
+    );
     return messages;
   }
 
@@ -521,7 +529,7 @@ class RestCuriosityApi implements CuriosityApi {
       messages.add(ChatMessage.fromJson(next));
     }
     logger.debug(
-      'Answered backend comprehension question for lesson $lessonId',
+      'Answered backend comprehension question for lesson $lessonId (${answer.trim().length} characters)',
     );
     return messages;
   }
@@ -880,7 +888,9 @@ class MockCuriosityApi implements CuriosityApi {
             'As ${lesson.interlocutor}, I will keep **${lesson.topic}** practical. You said: "$body". Here is the next useful piece to connect.',
           );
     _messages[lessonId]!.addAll([user, reply]);
-    logger.debug('Sent ${phase.label} message for lesson $lessonId');
+    logger.debug(
+      'Sent ${phase.label} message for lesson $lessonId (${body.trim().length} characters)',
+    );
     if (phase == Phase.refresher && !lesson.curiosityAvailable) {
       lesson.curiosityAvailable = true;
     }
@@ -949,7 +959,9 @@ class MockCuriosityApi implements CuriosityApi {
       );
     }
     _messages[lesson.id]!.addAll(messages);
-    logger.debug('Answered mock comprehension question for lesson $lessonId');
+    logger.debug(
+      'Answered mock comprehension question for lesson $lessonId (${answer.trim().length} characters)',
+    );
     return messages;
   }
 
@@ -1143,11 +1155,15 @@ Phase _phaseFromApi(String value) {
   };
 }
 
+DateTime? _optionalDate(Object? value) {
+  if (value is! String || value.isEmpty) {
+    return null;
+  }
+  return DateTime.tryParse(value);
+}
+
 class AndroidPushRegistrationCoordinator {
-  AndroidPushRegistrationCoordinator({
-    required this.api,
-    required this.logger,
-  });
+  AndroidPushRegistrationCoordinator({required this.api, required this.logger});
 
   static const String _androidFcmToken = String.fromEnvironment(
     'ANDROID_FCM_TOKEN',
@@ -1204,7 +1220,9 @@ class AndroidPushRegistrationCoordinator {
           ) ??
           false;
     } catch (exception) {
-      logger.warning('Android notification permission request failed: $exception');
+      logger.warning(
+        'Android notification permission request failed: $exception',
+      );
       return false;
     }
   }
@@ -1321,50 +1339,72 @@ class _CuriosityShellState extends State<CuriosityShell> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Curiosity'),
-        actions: [
-          _TopAction(
-            icon: Icons.home_rounded,
-            label: 'Start',
-            onPressed: () => _go('home'),
-          ),
-          _TopAction(
-            icon: Icons.menu_book_rounded,
-            label: 'Diary',
-            onPressed: () => _go('diary'),
-          ),
-          _TopAction(
-            icon: Icons.settings_rounded,
-            label: 'Settings',
-            onPressed: () => _go('settings'),
-          ),
-        ],
-      ),
-      body: SafeArea(
-        child: Column(
-          children: [
-            if (error != null)
-              MaterialBanner(
-                content: Text(error!),
-                actions: [
-                  TextButton(
-                    onPressed: () => setState(() => error = null),
-                    child: const Text('Dismiss'),
-                  ),
-                ],
-              ),
-            Expanded(
-              child: AnimatedSwitcher(
-                duration: const Duration(milliseconds: 180),
-                child: _page(),
-              ),
+    return PopScope(
+      canPop: !_handlesAndroidBackInternally,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop && _handlesAndroidBackInternally) {
+          _returnHomeFromBackButton();
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Curiosity'),
+          actions: [
+            _TopAction(
+              icon: Icons.home_rounded,
+              label: 'Start',
+              onPressed: () => _go('home'),
+            ),
+            _TopAction(
+              icon: Icons.menu_book_rounded,
+              label: 'Diary',
+              onPressed: () => _go('diary'),
+            ),
+            _TopAction(
+              icon: Icons.settings_rounded,
+              label: 'Settings',
+              onPressed: () => _go('settings'),
             ),
           ],
         ),
+        body: SafeArea(
+          child: Column(
+            children: [
+              if (error != null)
+                MaterialBanner(
+                  content: Text(error!),
+                  actions: [
+                    TextButton(
+                      onPressed: () => setState(() => error = null),
+                      child: const Text('Dismiss'),
+                    ),
+                  ],
+                ),
+              Expanded(
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 180),
+                  child: _page(),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
+  }
+
+  bool get _handlesAndroidBackInternally {
+    return !kIsWeb &&
+        defaultTargetPlatform == TargetPlatform.android &&
+        account != null &&
+        activePage != 'home';
+  }
+
+  void _returnHomeFromBackButton() {
+    final previousPage = activePage;
+    setState(() => activePage = 'home');
+    widget.logger.info('Android back returned to homepage from $previousPage');
+    _load();
   }
 
   Widget _page() {
@@ -1380,6 +1420,7 @@ class _CuriosityShellState extends State<CuriosityShell> {
       'history' => HistoryPage(lessons: lessons, onOpen: _openLesson),
       'lesson' => LessonPage(
         api: widget.api,
+        logger: widget.logger,
         lesson: selectedLesson,
         onLessonChanged: _refreshLesson,
         userAvatarBytes: userAvatarBytes,
@@ -1417,6 +1458,7 @@ class _CuriosityShellState extends State<CuriosityShell> {
       setState(() => activePage = 'home');
       return;
     }
+    widget.logger.debug('Navigated to $page page');
     setState(() => activePage = page);
     if (page == 'home' || page == 'history' || page == 'diary') {
       _load();
@@ -1431,6 +1473,7 @@ class _CuriosityShellState extends State<CuriosityShell> {
         selectedLesson = lesson;
         activePage = 'lesson';
       });
+      _logLessonTimeout(lesson);
     } catch (exception) {
       widget.logger.error('Create lesson failed: $exception');
       setState(() => error = exception.toString());
@@ -1504,6 +1547,28 @@ class _CuriosityShellState extends State<CuriosityShell> {
       selectedLesson = lesson;
       activePage = 'lesson';
     });
+    widget.logger.info('Opened lesson ${lesson.id}: ${lesson.title}');
+    _logLessonTimeout(lesson);
+  }
+
+  void _logLessonTimeout(Lesson lesson) {
+    final now = DateTime.now();
+    if (!lesson.refresherStarted &&
+        !lesson.refresherAvailable &&
+        lesson.refresherDueAt != null &&
+        lesson.refresherDueAt!.isAfter(now)) {
+      widget.logger.info(
+        'Lesson ${lesson.id} Refresher due in ${_durationLabel(lesson.refresherDueAt!.difference(now))}',
+      );
+    }
+    if (!lesson.curiosityStarted &&
+        !lesson.curiosityAvailable &&
+        lesson.curiosityDueAt != null &&
+        lesson.curiosityDueAt!.isAfter(now)) {
+      widget.logger.info(
+        'Lesson ${lesson.id} Curiosity due in ${_durationLabel(lesson.curiosityDueAt!.difference(now))}',
+      );
+    }
   }
 
   Future<void> _refreshLesson() async {
@@ -2055,6 +2120,7 @@ class HistoryPage extends StatelessWidget {
 class LessonPage extends StatefulWidget {
   const LessonPage({
     required this.api,
+    required this.logger,
     required this.lesson,
     required this.onLessonChanged,
     required this.userAvatarBytes,
@@ -2063,6 +2129,7 @@ class LessonPage extends StatefulWidget {
   });
 
   final CuriosityApi api;
+  final FrontendLogger logger;
   final Lesson? lesson;
   final Future<void> Function() onLessonChanged;
   final Uint8List? userAvatarBytes;
@@ -2211,6 +2278,7 @@ class _LessonPageState extends State<LessonPage> {
             itemCount: currentMessages.length,
             itemBuilder: (context, index) => ChatBubble(
               message: currentMessages[index],
+              logger: widget.logger,
               userAvatarBytes: widget.userAvatarBytes,
             ),
           ),
@@ -2306,8 +2374,14 @@ class _LessonPageState extends State<LessonPage> {
     }
     input.clear();
     if (phase == Phase.introduction && _looksLikeQuestionAnswer()) {
+      widget.logger.info(
+        'Sending Introduction answer for lesson ${lesson.id} (${text.length} characters)',
+      );
       await _run(phase, () => widget.api.answerQuestion(lesson.id, text));
     } else {
+      widget.logger.info(
+        'Sending ${phase.label} chat message for lesson ${lesson.id} (${text.length} characters)',
+      );
       await _run(phase, () => widget.api.sendMessage(lesson.id, phase, text));
     }
   }
@@ -2322,6 +2396,9 @@ class _LessonPageState extends State<LessonPage> {
   }
 
   Future<void> _startQuestions(Lesson lesson) async {
+    widget.logger.info(
+      'Starting comprehension questions for lesson ${lesson.id}',
+    );
     await _run(Phase.introduction, () => widget.api.startQuestions(lesson.id));
     if (mounted) {
       setState(() => questionsStarted = true);
@@ -2329,6 +2406,9 @@ class _LessonPageState extends State<LessonPage> {
   }
 
   Future<void> _startPhase(Lesson lesson, Phase targetPhase) async {
+    widget.logger.info(
+      'Opening ${targetPhase.label} phase for lesson ${lesson.id}',
+    );
     await _run(
       targetPhase,
       () => widget.api.startPhase(lesson.id, targetPhase),
@@ -2466,11 +2546,13 @@ class ChatComposer extends StatelessWidget {
 class ChatBubble extends StatelessWidget {
   const ChatBubble({
     required this.message,
+    required this.logger,
     required this.userAvatarBytes,
     super.key,
   });
 
   final ChatMessage message;
+  final FrontendLogger logger;
   final Uint8List? userAvatarBytes;
 
   @override
@@ -2504,12 +2586,72 @@ class ChatBubble extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           if (!isUser) ...[avatar, const SizedBox(width: 8)],
-          Flexible(child: bubble),
+          Flexible(
+            child: GestureDetector(
+              onLongPress: () => _copyMessage(context),
+              child: bubble,
+            ),
+          ),
           if (isUser) ...[const SizedBox(width: 8), avatar],
         ],
       ),
     );
   }
+
+  Future<void> _copyMessage(BuildContext context) async {
+    final text = message.bodyMarkdown;
+    await Clipboard.setData(ClipboardData(text: text));
+    logger.info(
+      'Copied ${message.phase.label} ${message.role.name} message ${message.id} (${text.length} characters) to clipboard',
+    );
+    if (context.mounted) {
+      _showTopPopup(context, 'Message copied');
+    }
+  }
+}
+
+void _showTopPopup(BuildContext context, String message) {
+  final overlay = Overlay.of(context);
+  late final OverlayEntry entry;
+  entry = OverlayEntry(
+    builder: (context) {
+      return Positioned(
+        top: MediaQuery.paddingOf(context).top + 12,
+        left: 16,
+        right: 16,
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 360),
+            child: Material(
+              elevation: 8,
+              borderRadius: BorderRadius.circular(8),
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 10,
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.check_circle_rounded, size: 18),
+                    const SizedBox(width: 8),
+                    Flexible(child: Text(message)),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+  );
+  overlay.insert(entry);
+  Timer(const Duration(seconds: 5), () {
+    if (entry.mounted) {
+      entry.remove();
+    }
+  });
 }
 
 class ProfileAvatar extends StatelessWidget {
@@ -2778,6 +2920,7 @@ class LogsPage extends StatefulWidget {
 
 class _LogsPageState extends State<LogsPage> {
   List<AppLogEntry> entries = [];
+  AppLogEntry? selectedEntry;
   bool loading = true;
 
   @override
@@ -2801,6 +2944,13 @@ class _LogsPageState extends State<LogsPage> {
 
   @override
   Widget build(BuildContext context) {
+    final selected = selectedEntry;
+    if (selected != null) {
+      return LogDetailPage(
+        entry: selected,
+        onBack: () => setState(() => selectedEntry = null),
+      );
+    }
     return Column(
       key: const ValueKey('logs'),
       children: [
@@ -2835,8 +2985,15 @@ class _LogsPageState extends State<LogsPage> {
               ? const Center(child: Text('No logs yet.'))
               : ListView.separated(
                   padding: const EdgeInsets.all(16),
-                  itemBuilder: (context, index) =>
-                      LogEntryTile(entry: entries[index]),
+                  itemBuilder: (context, index) => LogEntryTile(
+                    entry: entries[index],
+                    onTap: () {
+                      widget.logger.debug(
+                        'Opened log entry ${entries[index].source}/${entries[index].id}',
+                      );
+                      setState(() => selectedEntry = entries[index]);
+                    },
+                  ),
                   separatorBuilder: (_, __) => const SizedBox(height: 8),
                   itemCount: entries.length,
                 ),
@@ -2847,48 +3004,153 @@ class _LogsPageState extends State<LogsPage> {
 }
 
 class LogEntryTile extends StatelessWidget {
-  const LogEntryTile({required this.entry, super.key});
+  const LogEntryTile({required this.entry, required this.onTap, super.key});
 
   final AppLogEntry entry;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     final borderColor = entry.source == 'backend'
         ? const Color(0xFF4EA1FF)
         : const Color(0xFFFFD24D);
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        border: Border.all(color: borderColor, width: 1.4),
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
         borderRadius: BorderRadius.circular(8),
-        color: Theme.of(
-          context,
-        ).colorScheme.surfaceContainerHighest.withValues(alpha: 0.24),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            border: Border.all(color: borderColor, width: 1.4),
+            borderRadius: BorderRadius.circular(8),
+            color: Theme.of(
+              context,
+            ).colorScheme.surfaceContainerHighest.withValues(alpha: 0.24),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(
+                width: 112,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      entry.label.value,
+                      style: Theme.of(context).textTheme.labelLarge,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      _timestampLabel(entry.timestamp),
+                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(child: Text(entry.message)),
+              const SizedBox(width: 8),
+              const Icon(Icons.chevron_right_rounded),
+            ],
+          ),
+        ),
       ),
+    );
+  }
+}
+
+class LogDetailPage extends StatelessWidget {
+  const LogDetailPage({required this.entry, required this.onBack, super.key});
+
+  final AppLogEntry entry;
+  final VoidCallback onBack;
+
+  @override
+  Widget build(BuildContext context) {
+    final attributes = const JsonEncoder.withIndent(
+      '  ',
+    ).convert(entry.attributes);
+    return Column(
+      key: ValueKey('log-detail-${entry.source}-${entry.id}'),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(8, 8, 16, 4),
+          child: Row(
+            children: [
+              IconButton(
+                tooltip: 'Back to logs',
+                onPressed: onBack,
+                icon: const Icon(Icons.arrow_back_rounded),
+              ),
+              Expanded(
+                child: Text(
+                  'Log detail',
+                  style: Theme.of(context).textTheme.headlineSmall,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              _LogDetailRow(label: 'Source', value: entry.source),
+              _LogDetailRow(label: 'Level', value: entry.label.value),
+              _LogDetailRow(label: 'Severity', value: entry.severity.value),
+              _LogDetailRow(label: 'Logger', value: entry.loggerName),
+              _LogDetailRow(
+                label: 'Timestamp',
+                value: _timestampLabel(entry.timestamp),
+              ),
+              const SizedBox(height: 16),
+              Text('Message', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 8),
+              SelectableText(entry.message),
+              if (entry.attributes.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                Text(
+                  'Attributes',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 8),
+                SelectableText(attributes),
+              ],
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _LogDetailRow extends StatelessWidget {
+  const _LogDetailRow({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
-            width: 112,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  entry.label.value,
-                  style: Theme.of(context).textTheme.labelLarge,
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  _timestampLabel(entry.timestamp),
-                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
+            width: 96,
+            child: Text(
+              label,
+              style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
           ),
-          const SizedBox(width: 12),
-          Expanded(child: Text(entry.message)),
+          Expanded(child: SelectableText(value)),
         ],
       ),
     );
@@ -2911,6 +3173,20 @@ String _dateLabel(DateTime value) {
     'December',
   ];
   return '${value.day} ${months[value.month - 1]} ${value.year}';
+}
+
+String _durationLabel(Duration duration) {
+  final positive = duration.isNegative ? Duration.zero : duration;
+  final days = positive.inDays;
+  final hours = positive.inHours.remainder(24);
+  final minutes = positive.inMinutes.remainder(60);
+  if (days > 0) {
+    return '${days}d ${hours}h ${minutes}m';
+  }
+  if (hours > 0) {
+    return '${hours}h ${minutes}m';
+  }
+  return '${max(1, minutes)}m';
 }
 
 String _timestampLabel(DateTime value) {
